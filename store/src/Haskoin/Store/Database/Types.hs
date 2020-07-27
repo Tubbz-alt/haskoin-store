@@ -241,6 +241,7 @@ instance Serialize BlockKey where
         guard . (== 0x01) =<< getWord8
         BlockKey <$> get
 
+instance Key BlockKey
 instance KeyValue BlockKey BlockData
 
 -- | Block height database key.

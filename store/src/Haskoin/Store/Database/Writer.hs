@@ -1,25 +1,19 @@
-{-# LANGUAGE DeriveAnyClass    #-}
-{-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Haskoin.Store.Database.Writer (WriterT , runWriter) where
 
-import           Control.Applicative           ((<|>))
-import           Control.DeepSeq               (NFData)
 import           Control.Monad.Reader          (ReaderT (..))
 import qualified Control.Monad.Reader          as R
-import           Control.Monad.Trans.Maybe     (MaybeT (..), runMaybeT)
 import qualified Data.ByteString.Short         as B.Short
-import           Data.Hashable                 (Hashable)
 import           Data.HashMap.Strict           (HashMap)
 import qualified Data.HashMap.Strict           as M
 import           Data.List                     (sortOn)
 import           Data.Ord                      (Down (..))
+import           Data.Tuple                    (swap)
 import           Database.RocksDB              (BatchOp)
 import           Database.RocksDB.Query        (deleteOp, insertOp, writeBatch)
-import           GHC.Generics                  (Generic)
 import           Haskoin                       (Address, BlockHash, BlockHeight,
                                                 Network, OutPoint (..), TxHash,
                                                 headerHash, txHash)
@@ -31,59 +25,43 @@ import           UnliftIO                      (MonadIO, TVar, atomically,
                                                 liftIO, modifyTVar, newTVarIO,
                                                 readTVarIO)
 
-data Dirty a = Modified a | Deleted
-    deriving (Eq, Show, Generic, Hashable, NFData)
-
-instance Functor Dirty where
-    fmap _ Deleted      = Deleted
-    fmap f (Modified a) = Modified (f a)
-
 data Writer = Writer { getReader :: !DatabaseReader
                      , getState  :: !(TVar Memory) }
 
 type WriterT = ReaderT Writer
 
 instance MonadIO m => StoreReadBase (WriterT m) where
-    getNetwork =
-        R.ask >>= getNetworkI
-    getBestBlock =
-        R.ask >>= getBestBlockI
-    getBlocksAtHeight h =
-        R.ask >>= getBlocksAtHeightI h
-    getBlock b =
-        R.ask >>= getBlockI b
-    getTxData t =
-        R.ask >>= getTxDataI t
-    getSpender p =
-        R.ask >>= getSpenderI p
-    getUnspent a =
-        R.ask >>= getUnspentI a
-    getBalance a =
-        R.ask >>= getBalanceI a
-    getMempool =
-        R.ask >>= getMempoolI
+    getNetwork = getNetworkI
+    getBestBlock = getBestBlockI
+    getBlocksAtHeight = getBlocksAtHeightI
+    getBlock = getBlockI
+    getTxData = getTxDataI
+    getSpender = getSpenderI
+    getUnspent = getUnspentI
+    getBalance = getBalanceI
+    getMempool = getMempoolI
 
 data Memory = Memory
     { hNet
-      :: !Network
+      :: !(Maybe Network)
     , hBest
-      :: !(Maybe BlockHash)
+      :: !(Maybe (Maybe BlockHash))
     , hBlock
-      :: !(HashMap BlockHash BlockData)
+      :: !(HashMap BlockHash (Maybe BlockData))
     , hHeight
       :: !(HashMap BlockHeight [BlockHash])
     , hTx
-      :: !(HashMap TxHash TxData)
+      :: !(HashMap TxHash (Maybe TxData))
     , hSpender
-      :: !(HashMap OutPoint (Dirty Spender))
+      :: !(HashMap OutPoint (Maybe Spender))
     , hUnspent
-      :: !(HashMap OutPoint (Dirty UnspentVal))
+      :: !(HashMap OutPoint (Maybe Unspent))
     , hBalance
-      :: !(HashMap Address BalVal)
+      :: !(HashMap Address (Maybe Balance))
     , hAddrTx
-      :: !(HashMap (Address, TxRef) (Dirty ()))
+      :: !(HashMap (Address, TxRef) (Maybe ()))
     , hAddrOut
-      :: !(HashMap (Address, BlockRef, OutPoint) (Dirty OutVal))
+      :: !(HashMap (Address, BlockRef, OutPoint) (Maybe OutVal))
     , hMempool
       :: !(HashMap TxHash UnixTime)
     } deriving (Eq, Show)
@@ -150,16 +128,24 @@ instance MonadIO m => StoreWrite (WriterT m) where
         liftIO . atomically . modifyTVar s $
         deleteUnspentH p
 
-runWriter
-    :: MonadIO m
-    => DatabaseReader
-    -> WriterT m a
-    -> m a
-runWriter bdb@DatabaseReader{ databaseHandle = db
-                            , databaseNetwork = net } f = do
-    (mem, best) <- runReaderT ((,) <$> getMempool <*> getBestBlock) bdb
-    hm <- newTVarIO (emptyMemory net best mem)
-    x <- R.runReaderT f Writer {getReader = bdb, getState = hm}
+getLayered :: MonadIO m
+           => (Memory -> Maybe a)
+           -> DatabaseReaderT m a
+           -> WriterT m a
+getLayered f g =
+    ReaderT $ \Writer { getReader = db, getState = tmem } ->
+        f <$> readTVarIO tmem >>= \case
+            Just x -> return x
+            Nothing -> runReaderT g db
+
+runWriter :: MonadIO m
+          => DatabaseReader
+          -> WriterT m a
+          -> m a
+runWriter bdb@DatabaseReader{ databaseHandle = db } f = do
+    mem <- runReaderT getMempool bdb
+    hm <- newTVarIO (newMemory mem)
+    x <- R.runReaderT f Writer { getReader = bdb, getState = hm }
     ops <- hashMapOps <$> readTVarIO hm
     writeBatch db ops
     return x
@@ -177,144 +163,104 @@ hashMapOps db =
     mempoolOp (hMempool db) <>
     unspentOps (hUnspent db)
 
-bestBlockOp :: Maybe BlockHash -> [BatchOp]
-bestBlockOp Nothing  = [deleteOp BestKey]
-bestBlockOp (Just b) = [insertOp BestKey b]
+bestBlockOp :: Maybe (Maybe BlockHash) -> [BatchOp]
+bestBlockOp Nothing         = []
+bestBlockOp (Just Nothing)  = [deleteOp BestKey]
+bestBlockOp (Just (Just b)) = [insertOp BestKey b]
 
-blockHashOps :: HashMap BlockHash BlockData -> [BatchOp]
+blockHashOps :: HashMap BlockHash (Maybe BlockData) -> [BatchOp]
 blockHashOps = map (uncurry f) . M.toList
   where
-    f = insertOp . BlockKey
+    f k (Just d) = insertOp (BlockKey k) d
+    f k Nothing  = deleteOp (BlockKey k)
 
 blockHeightOps :: HashMap BlockHeight [BlockHash] -> [BatchOp]
 blockHeightOps = map (uncurry f) . M.toList
   where
     f = insertOp . HeightKey
 
-txOps :: HashMap TxHash TxData -> [BatchOp]
+txOps :: HashMap TxHash (Maybe TxData) -> [BatchOp]
 txOps = map (uncurry f) . M.toList
   where
-    f = insertOp . TxKey
+    f k (Just t) = insertOp (TxKey k) t
+    f k Nothing  = deleteOp (TxKey k)
 
-spenderOps :: HashMap OutPoint (Dirty Spender)
-           -> [BatchOp]
+spenderOps :: HashMap OutPoint (Maybe Spender) -> [BatchOp]
 spenderOps = map (uncurry f) . M.toList
   where
-    f o (Modified s) =
-        insertOp (SpenderKey o) s
-    f o Deleted =
-        deleteOp (SpenderKey o)
+    f o (Just s) = insertOp (SpenderKey o) s
+    f o Nothing  = deleteOp (SpenderKey o)
 
-balOps :: HashMap Address BalVal -> [BatchOp]
+balOps :: HashMap Address (Maybe Balance) -> [BatchOp]
 balOps = map (uncurry f) . M.toList
   where
-    f = insertOp . BalKey
+    f a (Just b) = insertOp (BalKey a) (balanceToVal b)
+    f a Nothing  = deleteOp (BalKey a)
 
-addrTxOps :: HashMap (Address, TxRef) (Dirty ()) -> [BatchOp]
+addrTxOps :: HashMap (Address, TxRef) (Maybe ()) -> [BatchOp]
 addrTxOps = map (uncurry f) . M.toList
   where
-    f (a, t) (Modified ()) = insertOp (AddrTxKey a t) ()
-    f (a, t) Deleted       = deleteOp (AddrTxKey a t)
+    f (a, t) (Just ()) = insertOp (AddrTxKey a t) ()
+    f (a, t) Nothing   = deleteOp (AddrTxKey a t)
 
 addrOutOps
-    :: HashMap (Address, BlockRef, OutPoint) (Dirty OutVal) -> [BatchOp]
+    :: HashMap (Address, BlockRef, OutPoint) (Maybe OutVal)
+    -> [BatchOp]
 addrOutOps = map (uncurry f) . M.toList
   where
-    f (a, b, p) (Modified l) =
+    f (a, b, p) (Just l) =
         insertOp
             (AddrOutKey { addrOutKeyA = a
                         , addrOutKeyB = b
                         , addrOutKeyP = p })
             l
-    f (a, b, p) Deleted =
+    f (a, b, p) Nothing =
         deleteOp AddrOutKey { addrOutKeyA = a
                             , addrOutKeyB = b
                             , addrOutKeyP = p }
 
 mempoolOp :: HashMap TxHash UnixTime -> [BatchOp]
-mempoolOp = (: [])
-          . insertOp MemKey
-          . sortOn Down
-          . map (\(h, t) -> (t, h))
-          . M.toList
+mempoolOp = return . insertOp MemKey . sortOn Down . map swap . M.toList
 
-unspentOps :: HashMap OutPoint (Dirty UnspentVal)
-           -> [BatchOp]
+unspentOps :: HashMap OutPoint (Maybe Unspent) -> [BatchOp]
 unspentOps = map (uncurry f) . M.toList
   where
-    f p (Modified u) =
-        insertOp (UnspentKey p) u
-    f p Deleted =
-        deleteOp (UnspentKey p)
+    f p (Just u) = insertOp (UnspentKey p) (snd (unspentToVal u))
+    f p Nothing  = deleteOp (UnspentKey p)
 
-getNetworkI :: MonadIO m => Writer -> m Network
-getNetworkI Writer {getState = hm} =
-    hNet <$> readTVarIO hm
+getNetworkI :: MonadIO m => WriterT m Network
+getNetworkI = getLayered hNet getNetwork
 
-getBestBlockI :: MonadIO m => Writer -> m (Maybe BlockHash)
-getBestBlockI Writer {getState = hm} =
-    getBestBlockH <$> readTVarIO hm
+getBestBlockI :: MonadIO m => WriterT m (Maybe BlockHash)
+getBestBlockI = getLayered getBestBlockH getBestBlock
 
-getBlocksAtHeightI :: MonadIO m
-                   => BlockHeight
-                   -> Writer
-                   -> m [BlockHash]
-getBlocksAtHeightI bh Writer {getState = hm, getReader = db} =
-    getBlocksAtHeightH bh <$> readTVarIO hm >>= \case
-        Just bs -> return bs
-        Nothing -> runReaderT (getBlocksAtHeight bh) db
+getBlocksAtHeightI :: MonadIO m => BlockHeight -> WriterT m [BlockHash]
+getBlocksAtHeightI bh = getLayered (getBlocksAtHeightH bh) (getBlocksAtHeight bh)
 
-getBlockI :: MonadIO m
-          => BlockHash
-          -> Writer
-          -> m (Maybe BlockData)
-getBlockI bh Writer {getReader = db, getState = hm} =
-    runMaybeT $ MaybeT f <|> MaybeT g
-  where
-    f = getBlockH bh <$> readTVarIO hm
-    g = runReaderT (getBlock bh) db
+getBlockI :: MonadIO m => BlockHash -> WriterT m (Maybe BlockData)
+getBlockI bh = getLayered (getBlockH bh) (getBlock bh)
 
-getTxDataI :: MonadIO m
-           => TxHash
-           -> Writer
-           -> m (Maybe TxData)
-getTxDataI th Writer {getReader = db, getState = hm} =
-    runMaybeT $ MaybeT f <|> MaybeT g
-  where
-    f = getTxDataH th <$> readTVarIO hm
-    g = runReaderT (getTxData th) db
+getTxDataI :: MonadIO m => TxHash -> WriterT m (Maybe TxData)
+getTxDataI th = getLayered (getTxDataH th) (getTxData th)
 
-getSpenderI :: MonadIO m => OutPoint -> Writer -> m (Maybe Spender)
-getSpenderI op Writer {getReader = db, getState = hm} =
-    getSpenderH op <$> readTVarIO hm >>= \case
-        Just (Modified s) -> return (Just s)
-        Just Deleted -> return Nothing
-        Nothing -> runReaderT (getSpender op) db
+getSpenderI :: MonadIO m => OutPoint -> WriterT m (Maybe Spender)
+getSpenderI op = getLayered (getSpenderH op) (getSpender op)
 
-getBalanceI :: MonadIO m => Address -> Writer -> m (Maybe Balance)
-getBalanceI a Writer {getReader = db, getState = hm} =
-    getBalanceH a <$> readTVarIO hm >>= \case
-        Just b -> return $ Just (valToBalance a b)
-        Nothing -> runReaderT (getBalance a) db
+getBalanceI :: MonadIO m => Address -> WriterT m (Maybe Balance)
+getBalanceI a = getLayered (getBalanceH a) (getBalance a)
 
-getUnspentI :: MonadIO m
-            => OutPoint
-            -> Writer
-            -> m (Maybe Unspent)
-getUnspentI op Writer {getReader = db, getState = hm} =
-    getUnspentH op <$> readTVarIO hm >>= \case
-        Just (Modified u) -> return (Just (valToUnspent op u))
-        Just Deleted -> return Nothing
-        Nothing -> runReaderT (getUnspent op) db
+getUnspentI :: MonadIO m => OutPoint -> WriterT m (Maybe Unspent)
+getUnspentI op = getLayered (getUnspentH op) (getUnspent op)
 
-getMempoolI :: MonadIO m => Writer -> m [TxRef]
-getMempoolI Writer {getState = hm} =
-    getMempoolH <$> readTVarIO hm
+getMempoolI :: MonadIO m => WriterT m [(UnixTime, TxHash)]
+getMempoolI =
+    ReaderT $ \Writer { getState = tmem } ->
+        getMempoolH <$> readTVarIO tmem
 
-emptyMemory :: Network -> Maybe BlockHash -> [TxRef] -> Memory
-emptyMemory net best mem =
-    Memory { hNet     = net
-           , hBest    = best
+newMemory :: [(UnixTime, TxHash)] -> Memory
+newMemory mem =
+    Memory { hNet     = Nothing
+           , hBest    = Nothing
            , hBlock   = M.empty
            , hHeight  = M.empty
            , hTx      = M.empty
@@ -323,38 +269,38 @@ emptyMemory net best mem =
            , hBalance = M.empty
            , hAddrTx  = M.empty
            , hAddrOut = M.empty
-           , hMempool = M.fromList $ map (\(TxRef (MemRef t) h) -> (h, t)) mem
+           , hMempool = M.fromList (map swap mem)
            }
 
-getBestBlockH :: Memory -> Maybe BlockHash
+getBestBlockH :: Memory -> Maybe (Maybe BlockHash)
 getBestBlockH = hBest
 
 getBlocksAtHeightH :: BlockHeight -> Memory -> Maybe [BlockHash]
 getBlocksAtHeightH h = M.lookup h . hHeight
 
-getBlockH :: BlockHash -> Memory -> Maybe BlockData
+getBlockH :: BlockHash -> Memory -> Maybe (Maybe BlockData)
 getBlockH h = M.lookup h . hBlock
 
-getTxDataH :: TxHash -> Memory -> Maybe TxData
+getTxDataH :: TxHash -> Memory -> Maybe (Maybe TxData)
 getTxDataH t = M.lookup t . hTx
 
-getSpenderH :: OutPoint -> Memory -> Maybe (Dirty Spender)
+getSpenderH :: OutPoint -> Memory -> Maybe (Maybe Spender)
 getSpenderH op db = M.lookup op (hSpender db)
 
-getBalanceH :: Address -> Memory -> Maybe BalVal
+getBalanceH :: Address -> Memory -> Maybe (Maybe Balance)
 getBalanceH a = M.lookup a . hBalance
 
-getMempoolH :: Memory -> [TxRef]
-getMempoolH = sortOn Down . map (\(h, t) -> TxRef (MemRef t) h) . M.toList . hMempool
+getMempoolH :: Memory -> [(UnixTime, TxHash)]
+getMempoolH = sortOn Down . map swap . M.toList . hMempool
 
 setBestH :: BlockHash -> Memory -> Memory
-setBestH h db = db {hBest = Just h}
+setBestH h db = db {hBest = Just (Just h)}
 
 insertBlockH :: BlockData -> Memory -> Memory
 insertBlockH bd db =
     db { hBlock = M.insert
                   (headerHash (blockDataHeader bd))
-                  bd
+                  (Just bd)
                   (hBlock db)
        }
 
@@ -364,41 +310,40 @@ setBlocksAtHeightH hs g db =
 
 insertTxH :: TxData -> Memory -> Memory
 insertTxH tx db =
-    db {hTx = M.insert (txHash (txData tx)) tx (hTx db)}
+    db {hTx = M.insert (txHash (txData tx)) (Just tx) (hTx db)}
 
 insertSpenderH :: OutPoint -> Spender -> Memory -> Memory
 insertSpenderH op s db =
-    db { hSpender = M.insert op (Modified s) (hSpender db) }
+    db { hSpender = M.insert op (Just s) (hSpender db) }
 
 deleteSpenderH :: OutPoint -> Memory -> Memory
 deleteSpenderH op db =
-    db { hSpender = M.insert op Deleted (hSpender db) }
+    db { hSpender = M.insert op Nothing (hSpender db) }
 
 setBalanceH :: Balance -> Memory -> Memory
 setBalanceH bal db =
-    db {hBalance = M.insert (balanceAddress bal) b (hBalance db)}
-  where
-    b = balanceToVal bal
+    db {hBalance = M.insert (balanceAddress bal) (Just bal) (hBalance db)}
 
 insertAddrTxH :: Address -> TxRef -> Memory -> Memory
 insertAddrTxH a tr db =
-    db { hAddrTx = M.insert (a, tr) (Modified ()) (hAddrTx db) }
+    db { hAddrTx = M.insert (a, tr) (Just ()) (hAddrTx db) }
 
 deleteAddrTxH :: Address -> TxRef -> Memory -> Memory
 deleteAddrTxH a tr db =
-    db { hAddrTx = M.insert (a, tr) Deleted (hAddrTx db) }
+    db { hAddrTx = M.insert (a, tr) Nothing (hAddrTx db) }
 
 insertAddrUnspentH :: Address -> Unspent -> Memory -> Memory
 insertAddrUnspentH a u db =
     let k = (a, unspentBlock u, unspentPoint u)
         v = OutVal { outValAmount = unspentAmount u
-                   , outValScript = B.Short.fromShort (unspentScript u) }
-     in db { hAddrOut = M.insert k (Modified v) (hAddrOut db) }
+                   , outValScript = B.Short.fromShort (unspentScript u)
+                   }
+     in db { hAddrOut = M.insert k (Just v) (hAddrOut db) }
 
 deleteAddrUnspentH :: Address -> Unspent -> Memory -> Memory
 deleteAddrUnspentH a u db =
     let k = (a, unspentBlock u, unspentPoint u)
-     in db { hAddrOut = M.insert k Deleted (hAddrOut db) }
+     in db { hAddrOut = M.insert k Nothing (hAddrOut db) }
 
 addToMempoolH :: TxHash -> UnixTime -> Memory -> Memory
 addToMempoolH h t db =
@@ -408,14 +353,14 @@ deleteFromMempoolH :: TxHash -> Memory -> Memory
 deleteFromMempoolH h db =
     db { hMempool = M.delete h (hMempool db) }
 
-getUnspentH :: OutPoint -> Memory -> Maybe (Dirty UnspentVal)
+getUnspentH :: OutPoint -> Memory -> Maybe (Maybe Unspent)
 getUnspentH op db = M.lookup op (hUnspent db)
 
 insertUnspentH :: Unspent -> Memory -> Memory
 insertUnspentH u db =
-    let (k, v) = unspentToVal u
-     in db { hUnspent = M.insert k (Modified v) (hUnspent db) }
+    let k = fst (unspentToVal u)
+     in db { hUnspent = M.insert k (Just u) (hUnspent db) }
 
 deleteUnspentH :: OutPoint -> Memory -> Memory
 deleteUnspentH op db =
-    db { hUnspent = M.insert op Deleted (hUnspent db) }
+    db { hUnspent = M.insert op Nothing (hUnspent db) }
